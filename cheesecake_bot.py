@@ -7,7 +7,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Cal
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВАШ_ТОКЕН_ЗДЕСЬ")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "ВАШ_GROQ_КЛЮЧ_ЗДЕСЬ")
 
-MANAGER_IDS = [125741486, 1320920569, 6025401601]
+MANAGER_IDS = [1321630636]
 
 logging.basicConfig(level=logging.INFO)
 
