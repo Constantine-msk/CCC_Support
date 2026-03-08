@@ -1,7 +1,7 @@
 import os
 import logging
 import httpx
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВАШ_ТОКЕН_ЗДЕСЬ")
@@ -10,6 +10,11 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "ВАШ_GROQ_КЛЮЧ_ЗДЕСЬ")
 MANAGER_IDS = [1321630636]
 
 logging.basicConfig(level=logging.INFO)
+
+# client_id -> manager_id (активные чаты)
+active_chats = {}
+# message_id сообщения менеджеру -> client_id (для reply)
+msg_to_client = {}
 
 SYSTEM_PROMPT = """Ты — вежливый и дружелюбный ИИ-помощник интернет-магазина Cheesecake Club.
 
@@ -34,7 +39,7 @@ SYSTEM_PROMPT = """Ты — вежливый и дружелюбный ИИ-по
 
 async def ask_groq(user_message: str, history: list) -> str:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(history[-6:])  # последние 3 пары сообщений
+    messages.extend(history[-6:])
     messages.append({"role": "user", "content": user_message})
 
     async with httpx.AsyncClient() as client:
@@ -72,10 +77,37 @@ def manager_button():
     ])
 
 
+async def notify_managers(context, user, text: str, client_id: int):
+    """Отправить сообщение всем менеджерам и запомнить message_id для reply"""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✋ Взять чат", callback_data=f"take_chat:{client_id}"),
+         InlineKeyboardButton("🔚 Закрыть чат", callback_data=f"end_chat:{client_id}")]
+    ])
+    msg_text = (
+        f"💬 <b>Клиент:</b> {user.full_name} (@{user.username or 'нет'})\n"
+        f"🆔 <code>{client_id}</code>\n\n"
+        f"📩 {text}\n\n"
+        f"<i>↩️ Нажмите Reply на это сообщение чтобы ответить</i>"
+    )
+    for manager_id in MANAGER_IDS:
+        try:
+            sent: Message = await context.bot.send_message(
+                chat_id=manager_id,
+                text=msg_text,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+            # Запоминаем: это сообщение менеджеру соответствует client_id
+            msg_to_client[f"{manager_id}:{sent.message_id}"] = client_id
+        except Exception:
+            pass
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["history"] = []
     context.user_data["mode"] = "ai"
     user = update.effective_user
+    active_chats.pop(user.id, None)
     await update.message.reply_text(
         f"👋 Привет, {user.first_name}!\n\n"
         f"Добро пожаловать в <b>Cheesecake Club</b> 🎂\n"
@@ -86,20 +118,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    context.user_data["mode"] = "ai"
+    active_chats.pop(user.id, None)
+    await update.message.reply_text(
+        "Возвращаемся в главное меню 🏠",
+        reply_markup=main_menu()
+    )
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user = query.from_user
 
     if query.data == "contact_manager":
-        context.user_data["mode"] = "manager"
+        context.user_data["mode"] = "manager_wait"
         await query.message.reply_text(
             "👨‍💼 Напишите ваш вопрос — менеджер ответит в ближайшее время.\n\n"
-            "Для отмены — /cancel"
+            "Для выхода — /cancel"
         )
 
     elif query.data == "main_menu":
         context.user_data["mode"] = "ai"
+        active_chats.pop(user.id, None)
         await query.message.reply_text(
             "🏠 Главное меню. Чем могу помочь?",
             reply_markup=main_menu()
@@ -107,92 +150,76 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data.startswith("take_chat:"):
         client_id = int(query.data.split(":")[1])
-        manager = query.from_user
-        await query.edit_message_text(
-            f"✅ @{manager.username or manager.first_name} взял чат\n\n"
-            f"Отвечайте: <code>/reply {client_id} текст</code>",
-            parse_mode="HTML"
-        )
+        active_chats[client_id] = user.id
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔚 Закрыть чат", callback_data=f"end_chat:{client_id}")]
+        ]))
         await context.bot.send_message(
             chat_id=client_id,
-            text="✅ Менеджер подключился и скоро ответит!"
+            text="✅ Менеджер подключился! Продолжайте писать.\n\nДля выхода — /cancel"
         )
 
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["mode"] = "ai"
-    await update.message.reply_text(
-        "Возвращаемся в главное меню 🏠",
-        reply_markup=main_menu()
-    )
-
-
-async def reply_to_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in MANAGER_IDS:
-        return
-    args = context.args
-    if not args or len(args) < 2:
-        await update.message.reply_text("Использование: /reply <client_id> <текст>")
-        return
-    try:
-        client_id = int(args[0])
-        text = " ".join(args[1:])
-        await context.bot.send_message(
-            chat_id=client_id,
-            text=f"💬 <b>Менеджер:</b> {text}",
-            parse_mode="HTML"
-        )
-        await update.message.reply_text("✅ Ответ отправлен")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+    elif query.data.startswith("end_chat:"):
+        client_id = int(query.data.split(":")[1])
+        active_chats.pop(client_id, None)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(f"✅ Чат с клиентом завершён.")
+        try:
+            await context.bot.send_message(
+                chat_id=client_id,
+                text="💬 Менеджер завершил чат. Если остались вопросы — напишите снова!",
+                reply_markup=main_menu()
+            )
+        except Exception:
+            pass
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
 
-    # Менеджеры
+    # ── МЕНЕДЖЕР отвечает через Reply ──
     if user.id in MANAGER_IDS:
+        replied = update.message.reply_to_message
+        if replied:
+            key = f"{user.id}:{replied.message_id}"
+            client_id = msg_to_client.get(key)
+            if client_id:
+                await context.bot.send_message(
+                    chat_id=client_id,
+                    text=f"💬 <b>Менеджер:</b> {text}",
+                    parse_mode="HTML"
+                )
+                await update.message.reply_text("✅ Отправлено клиенту")
+                return
         await update.message.reply_text(
-            "Для ответа клиенту:\n<code>/reply client_id текст</code>",
+            "↩️ Нажмите <b>Reply</b> на сообщение клиента чтобы ответить.",
             parse_mode="HTML"
         )
         return
 
     mode = context.user_data.get("mode", "ai")
 
-    # Режим живого менеджера
-    if mode == "manager":
-        context.user_data["mode"] = "ai"
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✋ Взять чат", callback_data=f"take_chat:{user.id}")]
-        ])
-        msg = (
-            f"💬 <b>Клиент хочет поговорить с менеджером</b>\n\n"
-            f"👤 {user.full_name} (@{user.username or 'нет'})\n"
-            f"🆔 <code>{user.id}</code>\n\n"
-            f"📩 {text}\n\n"
-            f"Ответить: <code>/reply {user.id} текст</code>"
-        )
-        for manager_id in MANAGER_IDS:
-            try:
-                await context.bot.send_message(
-                    chat_id=manager_id,
-                    text=msg,
-                    parse_mode="HTML",
-                    reply_markup=keyboard
-                )
-            except Exception:
-                pass
-
-        await update.message.reply_text(
-            "✅ Ваш запрос передан менеджеру!\n"
-            "Ответим в течение 30 минут в рабочее время.",
-            reply_markup=main_menu()
-        )
+    # ── КЛИЕНТ в активном чате с менеджером ──
+    if user.id in active_chats:
+        manager_id = active_chats[user.id]
+        await notify_managers(context, user, text, user.id)
         return
 
-    # Режим ИИ
+    # ── КЛИЕНТ написал первое сообщение менеджеру ──
+    if mode in ("manager_wait", "manager_active"):
+        context.user_data["mode"] = "manager_active"
+        await notify_managers(context, user, text, user.id)
+        if mode == "manager_wait":
+            await update.message.reply_text(
+                "✅ Запрос передан менеджеру!\n"
+                "Ответим в течение 30 минут в рабочее время.\n\n"
+                "Можете продолжать писать.\n"
+                "Для выхода — /cancel"
+            )
+        return
+
+    # ── Режим ИИ ──
     thinking = await update.message.reply_text("⏳ Думаю...")
     if "history" not in context.user_data:
         context.user_data["history"] = []
@@ -203,7 +230,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["history"].append({"role": "assistant", "content": ai_reply})
         await thinking.delete()
         await update.message.reply_text(ai_reply, reply_markup=manager_button())
-    except Exception as e:
+    except Exception:
         await thinking.delete()
         await update.message.reply_text(
             "😔 Произошла ошибка. Попробуйте позже или свяжитесь с менеджером.",
@@ -215,7 +242,6 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("reply", reply_to_client))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("✅ Cheesecake Club AI бот запущен!")
