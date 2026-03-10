@@ -29,11 +29,11 @@ logger = logging.getLogger(__name__)
 # =====================
 ru_holidays = holidays.RU()
 
-def is_non_working_day(date: datetime.date = None) -> bool:
+def is_non_working_day(date: datetime.date = None):
     d = date or datetime.date.today()
     return d.weekday() >= 5 or d in ru_holidays
 
-def next_working_day() -> datetime.date:
+def next_working_day():
     d = datetime.date.today() + datetime.timedelta(days=1)
     while is_non_working_day(d):
         d += datetime.timedelta(days=1)
@@ -44,11 +44,10 @@ products_cache = {"offers": [], "menu_text": "", "last_update": 0}
 # =====================
 # SYSTEM PROMPT
 # =====================
-def build_system_prompt(menu_text: str = "") -> str:
-    today = datetime.date.today()
-    weekday_ru = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
-    status = "✅ Работаем." if not is_non_working_day() else f"❌ Выходной. Доставка с {next_working_day().strftime('%d.%m.%Y')}."
-    return f" Ты — Ask Cheez AI, помощник Cheesecake Club Support. Сегодня: {today.strftime('%d.%m.%Y')}. {status}\nАкция: Дарим кусочек к каждому заказу! 🍰\nКАТАЛОГ:\n{menu_text}"
+def build_system_prompt(menu_text=""):
+    today = datetime.date.today().strftime('%d.%m.%Y')
+    status = "✅ Работаем." if not is_non_working_day() else "❌ Сегодня выходной."
+    return f"Ты Ask Cheez AI. Сегодня {today}. {status}\nАкция: кусочек в подарок! 🍰\nКАТАЛОГ:\n{menu_text}"
 
 # =====================
 # КЛАВИАТУРЫ
@@ -56,14 +55,15 @@ def build_system_prompt(menu_text: str = "") -> str:
 def main_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎂 Каталог", url="https://cheesecakeclub.ru/shop")],
-        [InlineKeyboardButton("🔍 Найти", callback_data="search"), InlineKeyboardButton("🔥 Популярные", callback_data="popular")],
+        [InlineKeyboardButton("🔍 Найти", callback_data="search"), 
+         InlineKeyboardButton("🔥 Популярные", callback_data="popular")],
         [InlineKeyboardButton("👨‍💼 Позвать менеджера", callback_data="manager")],
     ])
 
 def end_chat_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Вернуться к Ask Cheez AI", callback_data="end_chat")]])
 
-def manager_end_kb(client_id: int):
+def manager_end_kb(client_id):
     return InlineKeyboardMarkup([[InlineKeyboardButton("🏁 Завершить диалог", callback_data=f"m_end:{client_id}")]])
 
 # =====================
@@ -79,7 +79,7 @@ async def load_products():
             offers = []
             for o in root.findall(".//offer"):
                 offers.append({
-                    "name": o.find("name").text if o.find("name") is not None else "Без названия",
+                    "name": o.find("name").text if o.find("name") is not None else "Чизкейк",
                     "price": o.find("price").text if o.find("price") is not None else "0",
                     "picture": o.find("picture").text if o.find("picture") is not None else None,
                     "url": o.attrib.get("url", "https://cheesecakeclub.ru"),
@@ -91,8 +91,10 @@ async def send_cakes(update, context, cakes):
     for cake in cakes:
         cap = f"🍰 *{cake['name']}*\n💰 {cake['price']} ₽"
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("Купить", url=cake["url"])]])
-        if cake["picture"]: await context.bot.send_photo(update.effective_chat.id, cake["picture"], caption=cap, parse_mode="Markdown", reply_markup=kb)
-        else: await context.bot.send_message(update.effective_chat.id, cap, parse_mode="Markdown", reply_markup=kb)
+        if cake["picture"]:
+            await context.bot.send_photo(update.effective_chat.id, cake["picture"], caption=cap, parse_mode="Markdown", reply_markup=kb)
+        else:
+            await context.bot.send_message(update.effective_chat.id, cap, parse_mode="Markdown", reply_markup=kb)
 
 # =====================
 # ОБРАБОТЧИКИ
@@ -102,7 +104,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
-    # Ответ менеджера
+    # 1. Ответ менеджера
     if user_id in MANAGER_IDS and update.message.reply_to_message:
         reply_to = update.message.reply_to_message
         cid = context.bot_data.get(f"msg:{reply_to.message_id}")
@@ -114,15 +116,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ Отправлено {cid}", reply_markup=manager_end_kb(cid))
         return
 
-    # Режим менеджера
+    # 2. Режим менеджера
     if context.user_data.get("mode") == "manager" or not text:
         for m_id in MANAGER_IDS:
             fwd = await update.message.forward(m_id)
             context.bot_data[f"msg:{fwd.message_id}"] = user_id
-        if not text: await update.message.reply_text("📎 Файл передан менеджеру.")
+        if not text: await update.message.reply_text("📎 Передано менеджеру.")
         return
 
-    # Поиск
+    # 3. Поиск
     if context.user_data.pop("awaiting_search", False):
         await load_products()
         res = [o for o in products_cache["offers"] if text.lower() in o["name"].lower()][:3]
@@ -130,7 +132,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else: await update.message.reply_text("Ничего не нашлось 😔", reply_markup=main_kb())
         return
 
-    # AI Диалог
+    # 4. AI Диалог
     msg = await update.message.reply_text("⏳")
     hist = context.user_data.setdefault("history", [])
     await load_products()
@@ -144,11 +146,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hist.append({"role": "assistant", "content": ans})
             await msg.delete()
             await update.message.reply_text(ans, reply_markup=main_kb())
-    except: await msg.edit_text("Ошибка ИИ. Позвать менеджера?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👨‍💼 Менеджер", callback_data="manager")]]))
+    except: await msg.edit_text("Ошибка. Позвать менеджера?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👨‍💼 Менеджер", callback_data="manager")]]))
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "manager":
         context.user_data["mode"] = "manager"
-        for m_id in MANAGER_IDS: await context.bot.send_message(m_id, f"🚨 Клиент {query.from_user.full_name} (id: {
+        name = query.from_user.full_name
+        uid = query.from_user.id
+        for m_id in MANAGER_IDS:
+            await context.bot.send_message(m_id, f"🚨 Клиент {name} (id: {uid}) просит помощи!")
+        await query.message.reply_text("👨‍💼 Переключаю на менеджера. Пишите!", reply_markup=end_chat_kb())
+    elif query.data == "end_chat":
+        context.user_data["mode"] = "ai"
+        context.user_data["history"] = []
+        await query.edit_message_text("✅ Вы вернулись к Ask Cheez AI.", reply_markup=main_kb())
+    elif query.data.startswith("m_end:"):
+        cid = int(query.data.split(":")[1])
+        await context.bot.send_message(cid, "🤝 Менеджер завершил
