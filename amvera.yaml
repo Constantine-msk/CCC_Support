@@ -7,4 +7,3 @@ build:
   requirements_path: requirements.txt
 run:
   scriptName: cheesecake_bot.py
-  persistence_mount: /data
