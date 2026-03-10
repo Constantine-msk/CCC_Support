@@ -4,6 +4,6 @@ meta:
     name: pip
     version: 3.10
 build:
-  requirements_path: requirements.txt
+  requirementsPath: requirements.txt
 run:
   scriptName: cheesecake_bot.py
