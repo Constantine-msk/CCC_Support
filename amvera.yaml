@@ -1,0 +1,10 @@
+meta:
+  environment: python
+  toolchain:
+    name: pip
+    version: 3.10
+build:
+  requirements_path: requirements.txt
+run:
+  scriptName: cheesecake_bot.py
+  persistence_mount: /data
