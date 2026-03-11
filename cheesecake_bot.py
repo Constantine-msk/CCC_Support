@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import httpx
 import xml.etree.ElementTree as ET
@@ -101,6 +102,13 @@ def build_system_prompt(menu_text: str = "") -> str:
 - Доставка бесплатная при заказе от 3000 ₽
 - Заказ до 14:00 — доставка сегодня, после 14:00 — следующий рабочий день
 - В выходные/праздники: только самовывоз на Рябиновой, 32 (по договорённости)
+
+РАБОТА С АДРЕСАМИ ДОСТАВКИ:
+- Зона доставки: Москва, Внуково, Коммунарка, Одинцово
+- Если клиент называет адрес в зоне доставки — подтверди что доставим, и направь оформлять заказ на сайт
+- Если адрес вне зоны доставки — вежливо сообщи что пока не доставляем туда, предложи самовывоз на Рябиновой, 32 или прислать своего курьера (нужно связаться заранее)
+- Если рабочий день и адрес в зоне — скажи: "Отлично! Для оформления доставки по адресу [адрес] перейдите на сайт или уточните у менеджера"
+- Никогда не обещай конкретное время доставки самостоятельно — это уточняет менеджер
 
 ПРОЧЕЕ:
 - К каждому заказу дарим кусочек чизкейка
@@ -279,6 +287,69 @@ def cleanup_bot_data(bot_data: dict):
         logger.info(f"Очищено {len(stale)} устаревших записей bot_data")
 
 # =====================
+# РАСПОЗНАВАНИЕ АДРЕСА
+# =====================
+
+# Зона доставки
+DELIVERY_ZONES = ["москва", "внуково", "коммунарка", "одинцово"]
+
+# Паттерн для адресов:
+# "ул. Ленина 5", "Тверская 10 кв 3", "пр-т Мира, д. 15", "б-р Яна Райниса 3" и т.п.
+ADDRESS_PATTERN = re.compile(
+    r"""
+    (?:
+        ул(?:ица|\.)?|пр(?:-т|\.)?|проспект|пр-д|проезд|
+        б-р|бульвар|пл(?:ощадь|\.)?|ш(?:оссе|\.)?|
+        пер(?:еулок|\.)?|наб(?:ережная|\.)?|
+        туп(?:ик|\.)?|аллея|линия
+    )
+    [\s\.]?
+    [А-ЯЁа-яё\w\s\-\.]{2,40}?
+    ,?\s*
+    (?:д(?:ом|\.)?[\s\.]?)?
+    \d{1,4}
+    (?:[\/\-]\d{1,4})?
+    (?:\s*(?:кв|квартира|оф|офис)\.?\s*\d{1,4})?
+    """,
+    re.VERBOSE | re.IGNORECASE
+)
+
+ADDRESS_PATTERN_SHORT = re.compile(
+    r'\b[А-ЯЁ][а-яё]{3,}\s+\d{1,4}(?:[\/\-]\d{1,4})?\b'
+)
+
+def extract_address(text: str) -> str | None:
+    """Извлекает адрес из текста сообщения."""
+    m = ADDRESS_PATTERN.search(text)
+    if m:
+        return m.group(0).strip()
+    m = ADDRESS_PATTERN_SHORT.search(text)
+    if m:
+        return m.group(0).strip()
+    return None
+
+def in_delivery_zone(text: str) -> bool:
+    """Проверяет, упоминается ли в тексте зона доставки."""
+    text_lower = text.lower()
+    # Если город не упомянут явно — считаем Москву по умолчанию
+    other_cities = ["петербург", "спб", "краснодар", "екатеринбург", "новосибирск",
+                    "казань", "нижний", "самара", "ростов", "уфа", "пермь",
+                    "воронеж", "волгоград", "красноярск", "саратов"]
+    if any(c in text_lower for c in other_cities):
+        return False
+    return any(z in text_lower for z in DELIVERY_ZONES) or not any(
+        c in text_lower for c in other_cities
+    )
+
+def is_delivery_request(text: str) -> bool:
+    """Проверяет, похоже ли сообщение на запрос о доставке по адресу."""
+    text_lower = text.lower()
+    delivery_keywords = ["доставьте", "доставка", "привезите", "заказ", "доставить", "адрес", "привезти"]
+    has_keyword = any(k in text_lower for k in delivery_keywords)
+    has_address = extract_address(text) is not None
+    return has_address or (has_keyword and any(c.isdigit() for c in text))
+
+# =====================
 # START
 # =====================
 
@@ -369,6 +440,40 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.startswith("/find "):
         await handle_search_query(update, context, text[6:].strip())
         return
+
+    # Распознавание адреса доставки
+    address = extract_address(text)
+    if address:
+        if not in_delivery_zone(text):
+            await update.message.reply_text(
+                f"📍 Вижу адрес: *{address}*\n\n"
+                "😔 К сожалению, в этот район мы пока не доставляем.\n\n"
+                "Доставляем по: Москва, Внуково, Коммунарка, Одинцово.\n\n"
+                "Но вы можете:\n"
+                "• Забрать заказ самостоятельно на *Рябиновой, 32*\n"
+                "• Прислать своего курьера — свяжитесь с нами заранее",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👨‍💼 Уточнить у менеджера", callback_data="manager")]
+                ])
+            )
+            return
+        elif is_non_working_day():
+            await update.message.reply_text(
+                f"📍 Вижу адрес: *{address}*\n\n"
+                "❌ Сегодня выходной — доставка не работает.\n"
+                f"Ближайшая доставка: *{next_working_day().strftime('%d.%m.%Y')}*\n\n"
+                "Можете оформить заказ на сайте заранее!",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🛍 Оформить заказ", url="https://cheesecakeclub.ru/shop")],
+                    [InlineKeyboardButton("👨‍💼 Спросить менеджера", callback_data="manager")]
+                ])
+            )
+            return
+        else:
+            # Рабочий день, зона доставки — передаём адрес в AI как контекст
+            text = f"{text}\n[Клиент указал адрес доставки: {address}]"
 
     # Обычный диалог с AI
     thinking = await update.message.reply_text("⏳")
