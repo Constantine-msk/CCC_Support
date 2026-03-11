@@ -410,19 +410,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- 1б. МЕНЕДЖЕР ПИШЕТ БЕЗ REPLY ---
     if user_id in MANAGER_IDS:
-        # Проверяем есть ли активные клиенты
-        active_clients = [
-            v["client_id"] for k, v in context.bot_data.items()
-            if k.startswith("msg:") and isinstance(v, dict)
-        ]
-        if active_clients:
-            await update.message.reply_text(
-                "⚠️ Чтобы ответить клиенту, используйте *Reply* (кнопка «Ответить») "
-                "на пересланном сообщении от клиента.\n\n"
-                "Ваше сообщение клиенту *не отправлено*.",
-                parse_mode="Markdown"
-            )
-        return
+        # Пропускаем если ждём стикер
+        if context.user_data.get("awaiting_sticker"):
+            pass
+        else:
+            # Проверяем есть ли активные клиенты
+            active_clients = [
+                v["client_id"] for k, v in context.bot_data.items()
+                if k.startswith("msg:") and isinstance(v, dict)
+            ]
+            if active_clients:
+                await update.message.reply_text(
+                    "⚠️ Чтобы ответить клиенту, используйте *Reply* (кнопка «Ответить») "
+                    "на пересланном сообщении от клиента.\n\n"
+                    "Ваше сообщение клиенту *не отправлено*.",
+                    parse_mode="Markdown"
+                )
+            return
 
     # --- 2. КЛИЕНТ В РЕЖИМЕ МЕНЕДЖЕРА ---
     if context.user_data.get("mode") == "manager":
