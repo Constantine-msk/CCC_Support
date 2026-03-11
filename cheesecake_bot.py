@@ -383,8 +383,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if record:
             client_id = record["client_id"]
             try:
-                # copy_message не поддерживает reply_markup для медиа —
-                # используем forward, затем отдельно отправляем кнопку
                 await context.bot.copy_message(
                     chat_id=client_id,
                     from_chat_id=update.message.chat_id,
@@ -402,6 +400,25 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Ошибка отправки менеджером: {e}")
                 await update.message.reply_text("❌ Не удалось отправить сообщение клиенту.")
+        else:
+            # Reply есть, но сообщение не от клиента — просто игнорируем
+            pass
+        return
+
+    # --- 1б. МЕНЕДЖЕР ПИШЕТ БЕЗ REPLY ---
+    if user_id in MANAGER_IDS:
+        # Проверяем есть ли активные клиенты
+        active_clients = [
+            v["client_id"] for k, v in context.bot_data.items()
+            if k.startswith("msg:") and isinstance(v, dict)
+        ]
+        if active_clients:
+            await update.message.reply_text(
+                "⚠️ Чтобы ответить клиенту, используйте *Reply* (кнопка «Ответить») "
+                "на пересланном сообщении от клиента.\n\n"
+                "Ваше сообщение клиенту *не отправлено*.",
+                parse_mode="Markdown"
+            )
         return
 
     # --- 2. КЛИЕНТ В РЕЖИМЕ МЕНЕДЖЕРА ---
