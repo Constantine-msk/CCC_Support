@@ -622,11 +622,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # =====================
 
+async def getsticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Временная команда для получения file_id стикера."""
+    if update.effective_user.id not in MANAGER_IDS:
+        return
+    await update.message.reply_text("Отправьте стикер следующим сообщением.")
+    context.user_data["awaiting_sticker"] = True
+
+async def sticker_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получает file_id отправленного стикера."""
+    if update.effective_user.id not in MANAGER_IDS:
+        return
+    if context.user_data.pop("awaiting_sticker", False):
+        file_id = update.message.sticker.file_id
+        await update.message.reply_text(
+            f"✅ file_id стикера:\n\n`{file_id}`",
+            parse_mode="Markdown"
+        )
+
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("getsticker", getsticker))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.Sticker.ALL, sticker_handler))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.VOICE)
         & ~filters.COMMAND,
