@@ -1,104 +1,510 @@
-import os, logging, httpx, time, datetime, holidays
+import os
+import logging
+import httpx
 import xml.etree.ElementTree as ET
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+import time
+import datetime
+import holidays
 
-# Настройки
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters
+)
+
+# =====================
+# НАСТРОЙКИ
+# =====================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
 YML_URL = "https://cheesecakeclub.ru/tstore/yml/3b6b91d4c8f9e05c6c8a43e5f3d47476.yml"
+
 MANAGER_IDS = [1321630636]
-products_cache = {"offers": [], "menu_text": "", "last_update": 0}
 
-# Календарь
-def get_status():
-    d = datetime.date.today()
-    is_work = d.weekday() < 5 and d not in holidays.RU()
-    return "✅ Работаем" if is_work else "❌ Выходной"
+MAX_HISTORY = 10       # Максимум сообщений в истории
+BOT_DATA_TTL = 3600    # Секунд до очистки msg_to_client (1 час)
 
-# ТОВАРЫ
-async def load_products():
-    if time.time() - products_cache["last_update"] < 900: return
+# =====================
+# ЛОГИ
+# =====================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# =====================
+# КАЛЕНДАРЬ РФ
+# =====================
+
+ru_holidays = holidays.RU()
+
+def is_non_working_day(date: datetime.date = None) -> bool:
+    d = date or datetime.date.today()
+    return d.weekday() >= 5 or d in ru_holidays
+
+def next_working_day() -> datetime.date:
+    d = datetime.date.today() + datetime.timedelta(days=1)
+    while is_non_working_day(d):
+        d += datetime.timedelta(days=1)
+    return d
+
+# =====================
+# КЭШ ПРОДУКТОВ
+# =====================
+
+products_cache = {
+    "offers": [],
+    "menu_text": "",
+    "last_update": 0
+}
+
+# bot_data структура:
+# "msg:{msg_id}" -> {"client_id": int, "ts": float}
+
+# =====================
+# SYSTEM PROMPT (динамический — вызывается при каждом запросе)
+# =====================
+
+def build_system_prompt(menu_text: str = "") -> str:
+    today = datetime.date.today()
+    weekday_ru = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
+    day_name = weekday_ru[today.weekday()]
+    is_holiday = today in ru_holidays
+    holiday_note = f" (праздник: {ru_holidays.get(today)})" if is_holiday else ""
+
+    if not is_non_working_day():
+        delivery_status = "✅ Сегодня рабочий день, доставка работает."
+    else:
+        nwd = next_working_day()
+        delivery_status = (
+            f"❌ Сегодня выходной/праздник — доставки нет. "
+            f"Ближайший рабочий день: {nwd.strftime('%d.%m.%Y')}."
+        )
+
+    return f"""Ты — вежливый эксперт-консультант магазина Cheesecake Club.
+
+СЕГОДНЯ: {today.strftime('%d.%m.%Y')}, {day_name}{holiday_note}.
+{delivery_status}
+
+ПРАВИЛА ЗАКАЗА:
+- Минимальная сумма заказа: 3000 ₽ (и для доставки, и для самовывоза)
+- Если сумма меньше 3000 ₽: возможен самовывоз или можно прислать своего курьера, но нужно предварительно связаться с нами
+- Доставка работает только в будни (пн–пт), без праздников РФ
+- Доставка бесплатная при заказе от 3000 ₽
+- Заказ до 14:00 — доставка сегодня, после 14:00 — следующий рабочий день
+- В выходные/праздники: только самовывоз на Рябиновой, 32 (по договорённости)
+
+ПРОЧЕЕ:
+- К каждому заказу дарим кусочек чизкейка
+- Заказ оформляется на сайте cheesecakeclub.ru/shop
+- Если не знаешь ответа — предложи позвать менеджера
+- Отвечай кратко и по делу
+
+КАТАЛОГ:
+{menu_text if menu_text else "Меню временно недоступно."}
+"""
+
+# =====================
+# КЛАВИАТУРЫ
+# =====================
+
+def main_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎂 Каталог", url="https://cheesecakeclub.ru/shop")],
+        [InlineKeyboardButton("🔍 Найти чизкейк", callback_data="search"),
+         InlineKeyboardButton("🔥 Популярные", callback_data="popular")],
+        [InlineKeyboardButton("👨‍💼 Позвать менеджера", callback_data="manager")],
+    ])
+
+def end_chat_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Вернуться к ИИ-помощнику", callback_data="end_chat")]
+    ])
+
+def manager_end_kb(client_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏁 Завершить диалог с клиентом", callback_data=f"m_end:{client_id}")]
+    ])
+
+# =====================
+# ЗАГРУЗКА YML
+# =====================
+
+async def load_products() -> list:
+    now = time.time()
+    if now - products_cache["last_update"] < 900:
+        return products_cache["offers"]
+
     try:
         async with httpx.AsyncClient() as client:
-            r = await client.get(YML_URL, timeout=20)
-            root = ET.fromstring(r.content)
+            response = await client.get(YML_URL, timeout=20)
+            root = ET.fromstring(response.content)
             offers = []
-            for o in root.findall(".//offer"):
-                offers.append({
-                    "name": o.find("name").text if o.find("name") is not None else "Чизкейк",
-                    "price": o.find("price").text if o.find("price") is not None else "0",
-                    "picture": o.find("picture").text if o.find("picture") is not None else None,
-                    "url": o.attrib.get("url", "https://cheesecakeclub.ru")
-                })
-            products_cache.update({"offers": offers, "last_update": time.time(), "menu_text": "\n".join([o["name"] for o in offers[:20]])})
-    except: pass
+            for offer in root.findall(".//offer"):
+                name = offer.find("name")
+                price = offer.find("price")
+                picture = offer.find("picture")
+                description = offer.find("description")
+                url = offer.attrib.get("url", "https://cheesecakeclub.ru/shop")
+                if name is not None and price is not None:
+                    offers.append({
+                        "name": name.text or "",
+                        "price": price.text or "",
+                        "picture": picture.text if picture is not None else None,
+                        "description": description.text if description is not None else "",
+                        "url": url
+                    })
 
-async def send_cakes(update, context, cakes):
-    for c in cakes:
-        cap = f"🍰 *{c['name']}*\n💰 {c['price']} ₽"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Купить", url=c["url"])]])
-        if c["picture"]: await context.bot.send_photo(update.effective_chat.id, c["picture"], caption=cap, parse_mode="Markdown", reply_markup=kb)
-        else: await context.bot.send_message(update.effective_chat.id, cap, parse_mode="Markdown", reply_markup=kb)
+        products_cache["offers"] = offers
+        products_cache["last_update"] = now
+        products_cache["menu_text"] = "\n".join(
+            [f"• {o['name']} — {o['price']} ₽" for o in offers[:40]]
+        )
+        logger.info(f"YML загружен: {len(offers)} позиций")
 
-# ЛОГИКА
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
-    uid, text = update.effective_user.id, update.message.text
+    except Exception as e:
+        logger.error(f"YML error: {e}")
 
-    if uid in MANAGER_IDS and update.message.reply_to_message:
-        rid = context.bot_data.get(f"m:{update.message.reply_to_message.message_id}")
-        if rid:
-            await context.bot.copy_message(rid, uid, update.message.message_id, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Ask Cheez AI", callback_data="end_chat")]]))
-        return
+    return products_cache["offers"]
 
-    if context.user_data.get("m") == 1:
-        for m in MANAGER_IDS:
-            f = await update.message.forward(m)
-            context.bot_data[f"m:{f.message_id}"] = uid
-        return
+# =====================
+# ПОИСК ПО КАТАЛОГУ
+# =====================
 
-    if context.user_data.pop("s", 0):
-        await load_products()
-        res = [o for o in products_cache["offers"] if text.lower() in o["name"].lower()][:3]
-        await (send_cakes(update, context, res) if res else update.message.reply_text("Нет в наличии"))
-        return
+def search_products(query: str) -> list:
+    q = query.lower()
+    results = []
+    for offer in products_cache["offers"]:
+        name = (offer["name"] or "").lower()
+        desc = (offer["description"] or "").lower()
+        if q in name or q in desc:
+            results.append(offer)
+    return results[:5]
 
-    # AI
-    h = context.user_data.setdefault("h", [])
+# =====================
+# ОТПРАВКА КАРТОЧЕК
+# =====================
+
+async def send_cakes(update: Update, context: ContextTypes.DEFAULT_TYPE, cakes: list):
+    for cake in cakes:
+        text = f"🍰 *{cake['name']}*\n💰 {cake['price']} ₽"
+        if cake.get("description"):
+            text += f"\n_{cake['description'][:120]}_"
+
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Открыть в каталоге", url=cake["url"])]
+        ])
+
+        try:
+            if cake.get("picture"):
+                await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=cake["picture"],
+                    caption=text,
+                    parse_mode="Markdown",
+                    reply_markup=buttons
+                )
+            else:
+                raise ValueError("no picture")
+        except Exception:
+            # Fallback без фото
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=text,
+                    parse_mode="Markdown",
+                    reply_markup=buttons
+                )
+            except Exception as e:
+                logger.error(f"send_cakes fallback error '{cake['name']}': {e}")
+
+# =====================
+# AI
+# =====================
+
+async def ask_ai(message: str, history: list) -> str | None:
     await load_products()
-    try:
-        async with httpx.AsyncClient() as cl:
-            prompt = f"Ты Ask Cheez AI. {get_status()}. Акция: кусочек в подарок! Меню: {products_cache['menu_text']}"
-            r = await cl.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, json={"model": "llama-3.3-70b-versatile", "messages": [{"role":"system","content":prompt}] + h[-10:] + [{"role":"user","content":text}]}, timeout=30)
-            ans = r.json()["choices"][0]["message"]["content"]
-            h.append({"role":"user","content":text}); h.append({"role":"assistant","content":ans})
-            await update.message.reply_text(ans, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔍 Найти", callback_data="search"), InlineKeyboardButton("🔥 Хиты", callback_data="popular")],[InlineKeyboardButton("👨‍💼 Менеджер", callback_data="manager")]]))
-    except: await update.message.reply_text("Ошибка ИИ. Зову менеджера.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👨‍💼 Менеджер", callback_data="manager")]]))
+    menu = products_cache["menu_text"]
 
-async def btn(update, context):
-    q = update.callback_query; await q.answer()
-    if q.data == "manager":
-        context.user_data["m"] = 1
-        for m in MANAGER_IDS: await context.bot.send_message(m, f"🚨 Помощь! id: {q.from_user.id}")
-        await q.message.reply_text("👨‍💼 Менеджер на связи. Пишите!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Ask Cheez AI", callback_data="end_chat")]]))
-    elif q.data == "end_chat":
-        context.user_data.update({"m": 0, "h": []})
-        await q.message.reply_text("✅ Ask Cheez AI на связи!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔍 Найти", callback_data="search"), InlineKeyboardButton("🔥 Хиты", callback_data="popular")]]))
-    elif q.data == "search":
-        context.user_data["s"] = 1
-        await q.message.reply_text("🔍 Что ищем?")
-    elif q.data == "popular":
+    messages = [{"role": "system", "content": build_system_prompt(menu)}]
+    messages.extend(history[-(MAX_HISTORY):])
+    messages.append({"role": "user", "content": message})
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": messages,
+                    "max_tokens": 500,
+                    "temperature": 0.5
+                },
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+
+    except Exception as e:
+        logger.error(f"AI error: {e}")
+        return None  # None = сигнал для fallback
+
+# =====================
+# ОЧИСТКА bot_data
+# =====================
+
+def cleanup_bot_data(bot_data: dict):
+    now = time.time()
+    stale = [
+        k for k, v in bot_data.items()
+        if k.startswith("msg:") and isinstance(v, dict)
+        and now - v.get("ts", 0) > BOT_DATA_TTL
+    ]
+    for k in stale:
+        del bot_data[k]
+    if stale:
+        logger.info(f"Очищено {len(stale)} устаревших записей bot_data")
+
+# =====================
+# START
+# =====================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["mode"] = "ai"
+    context.user_data["history"] = []
+    context.user_data.pop("awaiting_search", None)
+    await load_products()
+    await update.message.reply_text(
+        "🍰 Привет! Я помощник *Cheesecake Club*.\n\n"
+        "Помогу выбрать десерт, расскажу про доставку или позову менеджера.",
+        parse_mode="Markdown",
+        reply_markup=main_kb()
+    )
+
+# =====================
+# ЕДИНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ
+# =====================
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    user_id = update.effective_user.id
+
+    # --- 1. МЕНЕДЖЕР ОТВЕЧАЕТ (reply на пересланное сообщение) ---
+    if user_id in MANAGER_IDS and update.message.reply_to_message:
+        reply_msg_id = update.message.reply_to_message.message_id
+        record = context.bot_data.get(f"msg:{reply_msg_id}")
+
+        if record:
+            client_id = record["client_id"]
+            try:
+                await context.bot.copy_message(
+                    chat_id=client_id,
+                    from_chat_id=user_id,
+                    message_id=update.message.message_id,
+                    reply_markup=end_chat_kb()
+                )
+                await update.message.reply_text(
+                    f"✅ Отправлено клиенту {client_id}",
+                    reply_markup=manager_end_kb(client_id)
+                )
+            except Exception as e:
+                logger.error(f"Ошибка отправки менеджером: {e}")
+                await update.message.reply_text("❌ Не удалось отправить сообщение клиенту.")
+        return
+
+    # --- 2. КЛИЕНТ В РЕЖИМЕ МЕНЕДЖЕРА ---
+    if context.user_data.get("mode") == "manager":
+        cleanup_bot_data(context.bot_data)
+        for m_id in MANAGER_IDS:
+            try:
+                fwd = await update.message.forward(chat_id=m_id)
+                context.bot_data[f"msg:{fwd.message_id}"] = {
+                    "client_id": user_id,
+                    "ts": time.time()
+                }
+            except Exception as e:
+                logger.error(f"Ошибка пересылки менеджеру: {e}")
+        return  # Молчим — менеджер сам ответит
+
+    # --- 3. РЕЖИМ ИИ ---
+
+    # Медиа в режиме ИИ — пересылаем менеджеру
+    if not update.message.text:
+        cleanup_bot_data(context.bot_data)
+        for m_id in MANAGER_IDS:
+            try:
+                fwd = await update.message.forward(chat_id=m_id)
+                context.bot_data[f"msg:{fwd.message_id}"] = {
+                    "client_id": user_id,
+                    "ts": time.time()
+                }
+            except Exception as e:
+                logger.error(f"Ошибка пересылки медиа: {e}")
+        await update.message.reply_text("📎 Файл передан менеджеру, он скоро свяжется.")
+        return
+
+    text = update.message.text
+
+    # Режим ожидания поискового запроса
+    if context.user_data.pop("awaiting_search", False):
+        await handle_search_query(update, context, text)
+        return
+
+    # Быстрый поиск через команду /find
+    if text.startswith("/find "):
+        await handle_search_query(update, context, text[6:].strip())
+        return
+
+    # Обычный диалог с AI
+    thinking = await update.message.reply_text("⏳")
+
+    history = context.user_data.setdefault("history", [])
+    history.append({"role": "user", "content": text})
+
+    # Ограничиваем размер истории
+    if len(history) > MAX_HISTORY * 2:
+        context.user_data["history"] = history[-(MAX_HISTORY * 2):]
+        history = context.user_data["history"]
+
+    answer = await ask_ai(text, history[:-1])
+
+    await thinking.delete()
+
+    if answer is None:
+        # Fallback: AI не ответил — убираем сообщение из истории и предлагаем менеджера
+        history.pop()
+        await update.message.reply_text(
+            "😔 Не могу ответить прямо сейчас. Позвать менеджера?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👨‍💼 Позвать менеджера", callback_data="manager")]
+            ])
+        )
+        return
+
+    history.append({"role": "assistant", "content": answer})
+    await update.message.reply_text(answer, reply_markup=main_kb())
+
+# =====================
+# ПОИСК (хелпер)
+# =====================
+
+async def handle_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
+    if not query:
+        await update.message.reply_text("Введите название или вкус для поиска.", reply_markup=main_kb())
+        return
+
+    await load_products()
+    results = search_products(query)
+
+    if not results:
+        await update.message.reply_text(
+            f"🔍 По запросу «{query}» ничего не найдено.\n\nПопробуйте другое слово или посмотрите весь каталог.",
+            reply_markup=main_kb()
+        )
+        return
+
+    await update.message.reply_text(f"🔍 Нашёл {len(results)} вариант(а) по запросу «{query}»:")
+    await send_cakes(update, context, results)
+
+# =====================
+# КНОПКИ
+# =====================
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+
+    if data == "manager":
+        context.user_data["mode"] = "manager"
+        context.user_data["history"] = []
+        context.user_data.pop("awaiting_search", None)
+        for m_id in MANAGER_IDS:
+            try:
+                await context.bot.send_message(
+                    m_id,
+                    f"🚨 Клиент {query.from_user.full_name} (id: {user_id}) просит помощи!"
+                )
+            except Exception as e:
+                logger.error(f"Уведомление менеджеру не отправлено: {e}")
+        await query.message.reply_text(
+            "👨‍💼 Переключаю на менеджера. ИИ отключён.\n\nПишите — передам!",
+            reply_markup=end_chat_kb()
+        )
+
+    elif data == "end_chat":
+        context.user_data["mode"] = "ai"
+        context.user_data["history"] = []
+        await query.edit_message_text("✅ Вы вернулись к ИИ-помощнику.", reply_markup=main_kb())
+
+    elif data.startswith("m_end:"):
+        try:
+            client_id = int(data.split(":")[1])
+            # Сбрасываем состояние клиента напрямую через application.user_data
+            client_data = context.application.user_data.get(client_id)
+            if client_data is not None:
+                client_data["mode"] = "ai"
+                client_data["history"] = []
+            await context.bot.send_message(
+                client_id,
+                "🤝 Менеджер завершил диалог. Если появятся вопросы — я здесь!",
+                reply_markup=main_kb()
+            )
+            await query.edit_message_text(f"✅ Диалог с клиентом {client_id} завершён.")
+        except Exception as e:
+            logger.error(f"m_end error: {e}")
+            await query.edit_message_text("❌ Не удалось завершить диалог.")
+
+    elif data == "popular":
         await load_products()
-        keys = ["нью-йорк", "дубай", "себастьян"]
-        hits = [o for o in products_cache["offers"] if any(k in o["name"].lower() for k in keys)]
-        await (send_cakes(update, context, hits[:4]) if hits else send_cakes(update, context, products_cache["offers"][:3]))
+        offers = products_cache["offers"]
+        if offers:
+            await query.message.reply_text("🔥 Популярные чизкейки:")
+            await send_cakes(update, context, offers[:3])
+        else:
+            await query.message.reply_text("😔 Каталог временно недоступен.", reply_markup=main_kb())
+
+    elif data == "search":
+        context.user_data["awaiting_search"] = True
+        await query.message.reply_text(
+            "🔍 Напишите название или вкус чизкейка:\n"
+            "_(например: «клубника», «шоколад», «манго»)_",
+            parse_mode="Markdown"
+        )
+
+# =====================
+# MAIN
+# =====================
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("🍰 Cheesecake Club Support", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔍 Найти", callback_data="search"), InlineKeyboardButton("🔥 Хиты", callback_data="popular")]]))))
-    app.add_handler(CallbackQueryHandler(btn))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.VOICE)
+        & ~filters.COMMAND,
+        on_message
+    ))
+
+    logger.info("Бот запущен ✅")
     app.run_polling()
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
