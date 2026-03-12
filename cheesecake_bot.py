@@ -639,9 +639,9 @@ async def sticker_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if context.user_data.pop("awaiting_sticker", False):
         file_id = update.message.sticker.file_id
+        # Без parse_mode — file_id может содержать спецсимволы
         await update.message.reply_text(
-            f"✅ file_id стикера:\n\n`{file_id}`",
-            parse_mode="Markdown"
+            f"file_id стикера:\n\n{file_id}"
         )
 
 def main():
@@ -658,7 +658,7 @@ def main():
     ))
 
     logger.info("Бот запущен ✅")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
