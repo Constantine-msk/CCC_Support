@@ -504,8 +504,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Рабочий день, зона доставки — передаём адрес в AI как контекст
             text = f"{text}\n[Клиент указал адрес доставки: {address}]"
 
-    # Обычный диалог с AI
-    thinking = await update.message.reply_text("⏳")
+    # Отправляем стикер-маскот вместо ⏳
+    MASCOT_STICKER_ID = "CAACAgIAAxkBAAIBd2mxszQQ7XU3nXd7yVKgnJo0qXxeAAJ1nwACTciISZvCHsXlPMPxOgQ"
+    thinking = await context.bot.send_sticker(
+        chat_id=update.effective_chat.id,
+        sticker=MASCOT_STICKER_ID
+    )
 
     history = context.user_data.setdefault("history", [])
     history.append({"role": "user", "content": text})
